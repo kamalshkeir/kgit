@@ -65,6 +65,7 @@ type RateLimit struct {
 	Limit     int
 	Remaining int
 	Reset     time.Time
+	Used      int
 }
 
 // DownloadGitFile downloads a file from any supported git provider
@@ -184,52 +185,60 @@ func CreateGitHubRepository(name string, isPrivate bool, config GitConfig) error
 
 // GitHub specific implementations
 func downloadGitHubFile(repoURL, filePath string, config GitConfig) ([]byte, error) {
-	// Convert github.com URL to raw content URL
+	// Convert github.com URL to API URL
 	repoURL = strings.TrimPrefix(repoURL, "https://")
 	repoURL = strings.TrimPrefix(repoURL, "github.com/")
 
-	// Try different branches
-	branches := []string{"master", "main", "HEAD", "dev", "development"}
-	var lastErr error
-	var isPrivateRepo bool
+	// Use the contents API instead of raw URL
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s", repoURL, filePath)
 
-	for _, branch := range branches {
-		rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repoURL, branch, filePath)
-
-		req, err := http.NewRequest("GET", rawURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("error creating request: %v", err)
-		}
-
-		if config.Token != "" {
-			req.Header.Add("Authorization", "Bearer "+config.Token)
-		}
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("error making request to %s: %v", branch, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		switch resp.StatusCode {
-		case http.StatusOK:
-			return io.ReadAll(resp.Body)
-		case http.StatusNotFound:
-			lastErr = fmt.Errorf("file not found in %s branch", branch)
-		case http.StatusUnauthorized, http.StatusForbidden:
-			isPrivateRepo = true
-			lastErr = fmt.Errorf("repository requires authentication")
-		default:
-			lastErr = fmt.Errorf("unexpected status in %s branch: %s", branch, resp.Status)
-		}
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
 	}
 
-	if isPrivateRepo {
-		return nil, fmt.Errorf("repository is private, please provide a valid GitHub token")
+	if config.Token != "" {
+		req.Header.Add("Authorization", "Bearer "+config.Token)
 	}
-	return nil, fmt.Errorf("file not found in any branch: %v", lastErr)
+	// Add headers to prevent caching
+	req.Header.Add("Cache-Control", "no-cache")
+	req.Header.Add("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var content struct {
+			Content  string `json:"content"`
+			Encoding string `json:"encoding"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&content); err != nil {
+			return nil, fmt.Errorf("error decoding response: %v", err)
+		}
+
+		// GitHub API returns base64 encoded content
+		if content.Encoding == "base64" {
+			decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", ""))
+			if err != nil {
+				return nil, fmt.Errorf("error decoding content: %v", err)
+			}
+			return decoded, nil
+		}
+		return []byte(content.Content), nil
+
+	case http.StatusNotFound:
+		return nil, ErrFileNotFound
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, fmt.Errorf("authentication required or insufficient permissions")
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+	}
 }
 
 func uploadGitHubFile(repoURL, filePath string, content []byte, message string, config GitConfig) error {
@@ -362,164 +371,136 @@ func deleteGitHubFile(repoURL, filePath string, config GitConfig) error {
 	return nil
 }
 
-func watchGitHubFile(repoURL, filePath string, interval int, config GitConfig) (chan FileChange, chan error) {
+func watchGitHubFile(repoURL, filePath string, interval int, config GitConfig) (<-chan FileChange, <-chan error) {
 	changes := make(chan FileChange)
 	errors := make(chan error)
-
-	var lastSHA string
-	var fileExists bool
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s",
-		strings.TrimPrefix(strings.TrimPrefix(repoURL, "https://"), "github.com/"),
-		filePath)
 
 	go func() {
 		defer close(changes)
 		defer close(errors)
 
+		var lastSHA string
+		currentInterval := interval
+
 		for {
+			// Use the contents API
+			apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s",
+				strings.TrimPrefix(strings.TrimPrefix(repoURL, "https://"), "github.com/"),
+				filePath)
+
 			req, err := http.NewRequest("GET", apiURL, nil)
 			if err != nil {
 				errors <- fmt.Errorf("error creating request: %v", err)
-				return
+				time.Sleep(time.Duration(currentInterval) * time.Second)
+				continue
 			}
 
 			if config.Token != "" {
 				req.Header.Add("Authorization", "Bearer "+config.Token)
 			}
+			req.Header.Add("Cache-Control", "no-cache")
+			req.Header.Add("Accept", "application/vnd.github.v3+json")
 
 			client := &http.Client{}
 			resp, err := client.Do(req)
 			if err != nil {
 				errors <- fmt.Errorf("error making request: %v", err)
-				time.Sleep(time.Duration(interval) * time.Second)
+				time.Sleep(time.Duration(currentInterval) * time.Second)
 				continue
 			}
 
-			// Check rate limits
+			// Get rate limit info and calculate new interval
 			rateLimit := getRateLimit(resp)
-			if rateLimit.Remaining == 0 {
-				waitDuration := time.Until(rateLimit.Reset)
-				errors <- fmt.Errorf("rate limit exceeded, waiting %v until reset", waitDuration.Round(time.Second))
-				time.Sleep(waitDuration)
-				resp.Body.Close()
-				continue
+			newInterval := calculateNewInterval(rateLimit, currentInterval)
+
+			if newInterval != currentInterval {
+				errors <- fmt.Errorf("rate limit: %d/%d, adjusting interval to %d seconds (reset in %v)",
+					rateLimit.Remaining, rateLimit.Limit, newInterval,
+					time.Until(rateLimit.Reset).Round(time.Second))
+				currentInterval = newInterval
 			}
 
-			// If we're close to rate limit, increase the interval
-			if rateLimit.Remaining < 100 {
-				newInterval := interval * 2
-				errors <- fmt.Errorf("approaching rate limit (%d remaining), increasing interval to %d seconds",
-					rateLimit.Remaining, newInterval)
-				interval = newInterval
+			// If we're out of requests, wait until reset
+			if rateLimit.Remaining <= 0 {
+				waitTime := time.Until(rateLimit.Reset)
+				errors <- fmt.Errorf("rate limit exceeded, waiting %v until reset", waitTime.Round(time.Second))
+				resp.Body.Close()
+				time.Sleep(waitTime)
+				currentInterval = interval // Reset to original interval after waiting
+				continue
 			}
 
 			switch resp.StatusCode {
 			case http.StatusOK:
-				var fileInfo FileInfo
+				var fileInfo struct {
+					SHA     string `json:"sha"`
+					Content string `json:"content"`
+				}
 				if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
-					errors <- fmt.Errorf("error decoding response: %v", err)
 					resp.Body.Close()
-					time.Sleep(time.Duration(interval) * time.Second)
+					errors <- fmt.Errorf("error decoding response: %v", err)
+					time.Sleep(time.Duration(currentInterval) * time.Second)
 					continue
 				}
 				resp.Body.Close()
 
-				if !fileExists {
-					fileExists = true
+				if lastSHA == "" {
 					lastSHA = fileInfo.SHA
-					changes <- FileChange{
-						Type:     FileCreated,
-						SHA:      fileInfo.SHA,
-						FileInfo: fileInfo,
+					// Decode and send initial content
+					if decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(fileInfo.Content, "\n", "")); err == nil {
+						changes <- FileChange{
+							Type: FileCreated,
+							SHA:  fileInfo.SHA,
+							FileInfo: FileInfo{
+								SHA:  fileInfo.SHA,
+								Size: len(decoded),
+							},
+						}
 					}
-				} else if lastSHA != fileInfo.SHA {
+				} else if fileInfo.SHA != lastSHA {
 					lastSHA = fileInfo.SHA
 					changes <- FileChange{
-						Type:     FileModified,
-						SHA:      fileInfo.SHA,
-						FileInfo: fileInfo,
+						Type: FileModified,
+						SHA:  fileInfo.SHA,
+						FileInfo: FileInfo{
+							SHA: fileInfo.SHA,
+						},
 					}
 				}
 
 			case http.StatusNotFound:
-				if fileExists {
-					fileExists = false
-					lastSHA = ""
+				resp.Body.Close()
+				if lastSHA != "" {
 					changes <- FileChange{
 						Type: FileDeleted,
 					}
+					lastSHA = ""
 				}
-				resp.Body.Close()
 
 			case http.StatusForbidden:
 				body, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				if strings.Contains(string(body), "rate limit exceeded") {
-					waitDuration := time.Until(rateLimit.Reset)
-					errors <- fmt.Errorf("rate limit exceeded, waiting %v until reset", waitDuration.Round(time.Second))
-					time.Sleep(waitDuration)
+					waitTime := time.Until(rateLimit.Reset)
+					errors <- fmt.Errorf("rate limit exceeded, waiting %v until reset", waitTime.Round(time.Second))
+					time.Sleep(waitTime)
+					currentInterval = interval // Reset to original interval after waiting
 					continue
 				}
 				errors <- fmt.Errorf("forbidden: %s", body)
 				return
 
-			case http.StatusUnauthorized:
-				resp.Body.Close()
-				errors <- fmt.Errorf("authentication required or token invalid")
-				return
-
 			default:
 				body, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				errors <- fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
-				time.Sleep(time.Duration(interval) * time.Second)
-				continue
+				errors <- fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
 			}
 
-			time.Sleep(time.Duration(interval) * time.Second)
+			time.Sleep(time.Duration(currentInterval) * time.Second)
 		}
 	}()
 
 	return changes, errors
-}
-
-// GitLab specific implementations
-func getGitLabProjectID(repoURL string, config GitConfig) (int, error) {
-	client := &http.Client{}
-	projectPath := strings.TrimPrefix(repoURL, "https://")
-	projectPath = strings.TrimPrefix(projectPath, "gitlab.com/")
-	projectPath = url.PathEscape(projectPath)
-
-	apiURL := fmt.Sprintf("https://gitlab.com/api/v4/projects/%s", projectPath)
-
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("error creating request: %v", err)
-	}
-
-	if config.Token != "" {
-		req.Header.Add("PRIVATE-TOKEN", config.Token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("error making request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("error getting project info: %s", resp.Status)
-	}
-
-	var project struct {
-		ID int `json:"id"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
-		return 0, fmt.Errorf("error decoding response: %v", err)
-	}
-
-	return project.ID, nil
 }
 
 func downloadGitLabFile(repoURL, filePath string, config GitConfig) ([]byte, error) {
@@ -1283,11 +1264,13 @@ func getRateLimit(resp *http.Response) *RateLimit {
 	limit, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Limit"))
 	remaining, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
 	reset, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
+	used, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Used"))
 
 	return &RateLimit{
 		Limit:     limit,
 		Remaining: remaining,
 		Reset:     time.Unix(reset, 0),
+		Used:      used,
 	}
 }
 
@@ -1325,5 +1308,38 @@ func fileExistsGitHub(repoURL, filePath string, config GitConfig) (bool, error) 
 	default:
 		body, _ := io.ReadAll(resp.Body)
 		return false, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
+	}
+}
+
+func calculateNewInterval(rateLimit *RateLimit, currentInterval int) int {
+	if rateLimit.Remaining <= 0 {
+		// Wait until reset
+		waitTime := time.Until(rateLimit.Reset)
+		return int(waitTime.Seconds()) + 1
+	}
+
+	// Calculate time until reset
+	timeUntilReset := time.Until(rateLimit.Reset)
+
+	// Calculate safe requests per second to avoid hitting limit
+	// Leave 10% of remaining requests as buffer
+	safeRequestsPerSecond := float64(rateLimit.Remaining) * 0.9 / timeUntilReset.Seconds()
+
+	if safeRequestsPerSecond <= 0 {
+		// If calculation results in 0 or negative, use original interval
+		return currentInterval
+	}
+
+	// Convert to interval (in seconds)
+	newInterval := int(1 / safeRequestsPerSecond)
+
+	// Don't let interval get too small or too large
+	switch {
+	case newInterval < 1:
+		return 1
+	case newInterval > 60:
+		return 60
+	default:
+		return newInterval
 	}
 }
